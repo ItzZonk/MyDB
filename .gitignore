@@ -1,0 +1,32 @@
+# Build directories
+build/
+out/
+bin/
+lib/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.ilk
+*.exp
+
+# Database data
+mydb_data/
+*.wal
+*.sst
+MANIFEST-*
+LOG
+
+# IDE / Editor settings
+.vscode/
+.vs/
+.idea/
+CMakeSettings.json
+*.suo
+*.user
+
+# Temporary files
+tmp/
+*.swp
+*.log

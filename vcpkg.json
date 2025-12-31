@@ -1,0 +1,19 @@
+{
+  "name": "mydb",
+  "version": "1.0.0",
+  "description": "High-Performance Hybrid LSM-Tree Database Engine",
+  "dependencies": [
+    {
+      "name": "spdlog",
+      "version": "1.12.0"
+    },
+    {
+      "name": "gtest",
+      "version": "1.14.0"
+    },
+    {
+      "name": "pybind11",
+      "version": "2.11.1"
+    }
+  ]
+}
