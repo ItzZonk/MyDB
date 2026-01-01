@@ -207,6 +207,8 @@ if(MYDB_BUILD_TESTS)
         tests/test_wal_recovery.cpp
         tests/test_sstable.cpp
         tests/test_bloom_filter.cpp
+        tests/test_similarity.cpp
+        tests/test_buffer_pool.cpp
     )
     
     target_link_libraries(mydb_tests 
