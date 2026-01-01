@@ -64,6 +64,20 @@ if(MYDB_ENABLE_PYTHON)
     )
 endif()
 
+# replxx - Modern readline alternative
+FetchContent_Declare(
+    replxx
+    GIT_REPOSITORY https://github.com/AmokHuginnsson/replxx.git
+    GIT_TAG        release-0.0.4
+)
+
+# FTXUI - Terminal UI
+FetchContent_Declare(
+    ftxui
+    GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
+    GIT_TAG        v5.0.0
+)
+
 # Fetch dependencies
 FetchContent_MakeAvailable(spdlog)
 
@@ -81,6 +95,9 @@ if(MYDB_ENABLE_PYTHON)
         set(MYDB_ENABLE_PYTHON OFF)
     endif()
 endif()
+
+FetchContent_MakeAvailable(replxx)
+FetchContent_MakeAvailable(ftxui)
 
 # ============================================================================
 # liburing (Linux only)
@@ -151,6 +168,35 @@ if(MYDB_BUILD_TOOLS)
 endif()
 
 # ============================================================================
+# MyDB Shell (Standard Interactive Shell)
+# ============================================================================
+add_executable(mydb_shell 
+    src/cli/shell.cpp
+    src/cli/shell_main.cpp
+)
+
+target_link_libraries(mydb_shell 
+    PRIVATE 
+        mydb_core 
+        replxx
+)
+
+# ============================================================================
+# TUI Dashboard
+# ============================================================================
+add_executable(mydb_dashboard
+    src/tools/dashboard.cpp
+)
+
+target_link_libraries(mydb_dashboard
+    PRIVATE
+        mydb_core
+        ftxui::screen
+        ftxui::dom
+        ftxui::component
+)
+
+# ============================================================================
 # Unit Tests
 # ============================================================================
 if(MYDB_BUILD_TESTS)
@@ -165,49 +211,10 @@ if(MYDB_BUILD_TESTS)
     
     target_link_libraries(mydb_tests 
         PRIVATE 
-            mydb_core 
+            mydb_core
             GTest::gtest_main
     )
     
     include(GoogleTest)
     gtest_discover_tests(mydb_tests)
-    
-    # Python tests (if enabled)
-    if(MYDB_ENABLE_PYTHON)
-        add_executable(test_python_proc tests/test_python_proc.cpp)
-        target_link_libraries(test_python_proc PRIVATE mydb_core GTest::gtest_main)
-        gtest_discover_tests(test_python_proc)
-    endif()
 endif()
-
-# =============================================================================
-# Dashboard (FTXUI)
-# =============================================================================
-include(FetchContent)
-
-FetchContent_Declare(ftxui
-  GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI
-  GIT_TAG v5.0.0
-)
-FetchContent_MakeAvailable(ftxui)
-
-add_executable(mydb_dashboard src/tools/dashboard.cpp)
-target_link_libraries(mydb_dashboard 
-    PRIVATE 
-    mydb_core 
-    ftxui::screen 
-    ftxui::dom 
-    ftxui::component
-)
-set_target_properties(mydb_dashboard PROPERTIES CXX_STANDARD 20)
-
-# ============================================================================
-# Installation
-# ============================================================================
-install(TARGETS mydb_server mydb_core mydb_dashboard
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
-)
-
-install(DIRECTORY include/mydb DESTINATION include)

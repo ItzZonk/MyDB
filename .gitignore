@@ -18,6 +18,9 @@ mydb_data/
 MANIFEST-*
 LOG
 
+# Large Models
+models/
+
 # IDE / Editor settings
 .vscode/
 .vs/
