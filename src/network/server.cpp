@@ -8,6 +8,7 @@
 #include <mydb/db.hpp>
 
 #include <spdlog/spdlog.h>
+#include <sstream>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -30,9 +31,10 @@ namespace mydb {
 // Connection Implementation
 // ============================================================================
 
-Connection::Connection(int fd, IOContext* io_context)
+Connection::Connection(int fd, IOContext* io_context, ReadCallback callback)
     : fd_(fd)
-    , io_context_(io_context) {
+    , io_context_(io_context)
+    , callback_(std::move(callback)) {
     read_buffer_.resize(kReadBufferSize);
 }
 
@@ -51,27 +53,21 @@ void Connection::Close() {
     }
 }
 
-Status Connection::StartRead() {
-    if (!active_.load()) {
-        return Status::InvalidArgument("Connection not active");
-    }
+void Connection::StartRead() {
+    if (!active_.load()) return;
     
-    return io_context_->SubmitRecv(
+    io_context_->SubmitRecv(
         fd_,
         std::span<char>(read_buffer_.data(), read_buffer_.size()),
         0,
         [this](int result, int) {
-            if (result <= 0) {
-                Close();
-            }
+            callback_(this, result);
         }
     );
 }
 
 Status Connection::SendResponse(const std::vector<char>& data) {
-    if (!active_.load()) {
-        return Status::InvalidArgument("Connection not active");
-    }
+    if (!active_.load()) return Status::InvalidArgument("Connection not active");
     
     write_buffer_ = data;
     
@@ -110,14 +106,12 @@ void Server::SetRequestHandler(RequestHandler handler) {
 
 Status Server::Start() {
 #ifdef _WIN32
-    // Initialize Winsock
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         return Status::IOError("Failed to initialize Winsock");
     }
 #endif
     
-    // Create socket
 #ifdef _WIN32
     listen_fd_ = static_cast<int>(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
 #else
@@ -128,7 +122,6 @@ Status Server::Start() {
         return Status::IOError("Failed to create socket");
     }
     
-    // Set socket options
     int opt = 1;
 #ifdef _WIN32
     setsockopt(static_cast<SOCKET>(listen_fd_), SOL_SOCKET, SO_REUSEADDR, 
@@ -137,7 +130,6 @@ Status Server::Start() {
     setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #endif
     
-    // Bind
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -147,19 +139,15 @@ Status Server::Start() {
         return Status::IOError("Failed to bind to port " + std::to_string(port_));
     }
     
-    // Listen
     if (listen(listen_fd_, 128) < 0) {
         return Status::IOError("Failed to listen");
     }
     
-    // Create I/O context
     io_context_ = IOContext::Create(kIOURingQueueDepth);
-    
     running_.store(true);
     
     spdlog::info("Server listening on port {}", port_);
     
-    // Start accepting connections
     io_context_->SubmitAccept(listen_fd_, [this](int result, int) {
         HandleAccept(result);
     });
@@ -168,19 +156,15 @@ Status Server::Start() {
 }
 
 void Server::Stop() {
-    if (!running_.exchange(false)) {
-        return;
-    }
+    if (!running_.exchange(false)) return;
     
     io_context_->Stop();
     
-    // Close all connections
     {
         std::lock_guard<std::mutex> lock(connections_mutex_);
         connections_.clear();
     }
     
-    // Close listen socket
     if (listen_fd_ != INVALID_SOCK) {
 #ifdef _WIN32
         closesocket(static_cast<SOCKET>(listen_fd_));
@@ -190,7 +174,6 @@ void Server::Stop() {
 #endif
         listen_fd_ = INVALID_SOCK;
     }
-    
     spdlog::info("Server stopped");
 }
 
@@ -198,7 +181,11 @@ void Server::HandleAccept(int result) {
     if (!running_.load()) return;
     
     if (result >= 0) {
-        auto conn = std::make_unique<Connection>(result, io_context_.get());
+        auto conn = std::make_unique<Connection>(
+            result, 
+            io_context_.get(),
+            [this](Connection* c, int res) { HandleRead(c, res); }
+        );
         
         {
             std::lock_guard<std::mutex> lock(connections_mutex_);
@@ -208,12 +195,9 @@ void Server::HandleAccept(int result) {
         }
         
         spdlog::debug("Accepted connection: fd={}", result);
-        
-        // Start reading from the new connection
         connections_[result]->StartRead();
     }
     
-    // Queue up next accept
     io_context_->SubmitAccept(listen_fd_, [this](int res, int) {
         HandleAccept(res);
     });
@@ -221,22 +205,47 @@ void Server::HandleAccept(int result) {
 
 void Server::HandleRead(Connection* conn, int result) {
     if (result <= 0) {
-        // Connection closed or error
         std::lock_guard<std::mutex> lock(connections_mutex_);
         connections_.erase(conn->Fd());
         stats_.active_connections = connections_.size();
         return;
     }
     
-    // TODO: Parse request and process
     stats_.bytes_received += result;
+    
+    conn->pending_buffer_.insert(
+        conn->pending_buffer_.end(), 
+        conn->read_buffer_.begin(), 
+        conn->read_buffer_.begin() + result
+    );
+    
+    // Process messages
+    while (Protocol::HasCompleteMessage(Slice(conn->pending_buffer_.data(), conn->pending_buffer_.size()))) {
+        Slice s(conn->pending_buffer_.data(), conn->pending_buffer_.size());
+        
+        auto req_result = Protocol::ParseRequest(s);
+        
+        if (req_result.ok()) {
+            std::vector<char> response = request_handler_ 
+                ? request_handler_(conn->pending_buffer_, conn)
+                : DefaultHandler(conn->pending_buffer_, conn);
+                
+            conn->SendResponse(response);
+            conn->pending_buffer_.clear(); 
+            break; 
+        } else {
+             spdlog::error("Parse error: {}", req_result.status().message());
+             conn->pending_buffer_.clear();
+             break; 
+        }
+    }
+
+    conn->StartRead();
 }
 
 std::vector<char> Server::DefaultHandler(const std::vector<char>& request, Connection* conn) {
     if (!db_) {
-        return Protocol::EncodeResponse(ErrorResponse{
-            response::kError, "Database not initialized"
-        });
+        return Protocol::EncodeResponse(ErrorResponse{response::kError, "Database not initialized"});
     }
     
     auto req_result = Protocol::ParseRequest(Slice(request.data(), request.size()));
@@ -248,35 +257,75 @@ std::vector<char> Server::DefaultHandler(const std::vector<char>& request, Conne
     
     const auto& req = req_result.value();
     
+    spdlog::info("Processing request, variant index: {}", req.index());
+    
     return std::visit([this](auto&& r) -> std::vector<char> {
         using T = std::decay_t<decltype(r)>;
         
         if constexpr (std::is_same_v<T, PutRequest>) {
             Status s = db_->Put(r.key, r.value);
-            if (s.ok()) {
-                return Protocol::EncodeResponse(OkResponse{"OK"});
-            }
-            return Protocol::EncodeResponse(ErrorResponse{response::kError, s.message()});
+            return Protocol::EncodeResponse(s.ok() ? Response{OkResponse{"OK"}} 
+                                                   : Response{ErrorResponse{response::kError, s.message()}});
         }
         else if constexpr (std::is_same_v<T, GetRequest>) {
             ReadOptions opts;
-            if (r.snapshot.has_value()) {
-                opts.snapshot = r.snapshot.value();
-            }
-            // If snapshot is empty/0, Database::Get will default to latest sequence.
-            
+            if (r.snapshot.has_value()) opts.snapshot = r.snapshot.value();
             auto result = db_->Get(r.key, opts);
+            
+            spdlog::info("GET request: key='{}' field.has_value={} field='{}'", 
+                r.key, r.field.has_value(), r.field.value_or("(none)"));
+            
             if (result.ok()) {
-                return Protocol::EncodeResponse(ValueResponse{result.value()});
+                std::string val = result.value();
+                
+                // Field Extraction Logic
+                if (r.field.has_value()) {
+                    std::string field_name = r.field.value();
+                    spdlog::info("Attempting extraction. val='{}', field='{}'", val, field_name);
+                    
+                    // Try to find field:value pattern (supports quoted and unquoted keys)
+                    size_t pos = val.find("\"" + field_name + "\"");
+                    if (pos == std::string::npos) {
+                        pos = val.find(field_name + ":");
+                    }
+                    if (pos == std::string::npos) {
+                        pos = val.find(field_name);
+                    }
+                    
+                    if (pos != std::string::npos) {
+                        size_t colon = val.find(":", pos);
+                        if (colon != std::string::npos) {
+                            size_t start = colon + 1;
+                            while (start < val.size() && isspace(val[start])) start++;
+                            
+                            // Find end: comma, semicolon, or closing brace
+                            size_t end = val.find_first_of(",;}", start);
+                            if (end == std::string::npos) end = val.size();
+                            
+                            std::string extracted = val.substr(start, end - start);
+                            
+                            // Trim whitespace
+                            while (!extracted.empty() && isspace(extracted.back())) extracted.pop_back();
+                            
+                            // Remove quotes if present
+                            if (extracted.size() >= 2 && extracted.front() == '"' && extracted.back() == '"') {
+                                extracted = extracted.substr(1, extracted.size() - 2);
+                            }
+                            
+                            return Protocol::EncodeResponse(ValueResponse{extracted});
+                        }
+                    }
+                    return Protocol::EncodeResponse(ErrorResponse{response::kNotFound, "Field not found"});
+                }
+                
+                return Protocol::EncodeResponse(ValueResponse{val});
             }
             return Protocol::EncodeResponse(ErrorResponse{response::kNotFound, "Not found"});
         }
         else if constexpr (std::is_same_v<T, DeleteRequest>) {
             Status s = db_->Delete(r.key);
-            if (s.ok()) {
-                return Protocol::EncodeResponse(OkResponse{"OK"});
-            }
-            return Protocol::EncodeResponse(ErrorResponse{response::kError, s.message()});
+             return Protocol::EncodeResponse(s.ok() ? Response{OkResponse{"OK"}} 
+                                                    : Response{ErrorResponse{response::kError, s.message()}});
         }
         else if constexpr (std::is_same_v<T, PingRequest>) {
             return Protocol::EncodeResponse(OkResponse{"PONG"});
@@ -284,43 +333,44 @@ std::vector<char> Server::DefaultHandler(const std::vector<char>& request, Conne
         else if constexpr (std::is_same_v<T, StatusRequest>) {
             auto stats = db_->GetStats();
             return Protocol::EncodeResponse(StatusResponse{
-                stats.num_entries,
-                stats.memtable_size,
-                stats.num_sstables,
-                db_->GetVersion()
+                stats.num_entries, stats.memtable_size, stats.num_sstables, db_->GetVersion()
             });
         }
         else if constexpr (std::is_same_v<T, FlushRequest>) {
-            Status s = db_->Flush();
-            if (s.ok()) {
-                return Protocol::EncodeResponse(OkResponse{"Flushed"});
-            }
-            return Protocol::EncodeResponse(ErrorResponse{response::kError, s.message()});
+             Status s = db_->Flush();
+             return Protocol::EncodeResponse(s.ok() ? Response{OkResponse{"Flushed"}} 
+                                                    : Response{ErrorResponse{response::kError, s.message()}});
         }
         else if constexpr (std::is_same_v<T, CompactRequest>) {
-            Status s = db_->CompactLevel(r.level);
-            if (s.ok()) {
-                return Protocol::EncodeResponse(OkResponse{"Compacted"});
+             Status s = db_->CompactLevel(r.level);
+             return Protocol::EncodeResponse(s.ok() ? Response{OkResponse{"Compacted"}} 
+                                                    : Response{ErrorResponse{response::kError, s.message()}});
+        }
+        else if constexpr (std::is_same_v<T, IntrospectRequest>) {
+            if (r.target == "BUFFERPOOL") {
+                auto* bpm = db_->GetBufferPoolManager();
+                if (!bpm) return Protocol::EncodeResponse(ErrorResponse{response::kError, "BufferPool not initialized"});
+                
+                auto state = bpm->GetState();
+                std::ostringstream oss;
+                for (const auto& f : state) {
+                    oss << "id:" << f.page_id << " pin:" << f.pin_count << " dirty:" << f.is_dirty << "\n";
+                }
+                return Protocol::EncodeResponse(ValueResponse{oss.str()});
             }
-            return Protocol::EncodeResponse(ErrorResponse{response::kError, s.message()});
+            return Protocol::EncodeResponse(ErrorResponse{response::kInvalidRequest, "Unknown introspect target"});
         }
         else if constexpr (std::is_same_v<T, ExecPythonRequest>) {
 #ifdef MYDB_ENABLE_PYTHON
             auto result = db_->ExecutePython(r.script);
-            if (result.ok()) {
-                return Protocol::EncodeResponse(ValueResponse{result.value()});
-            }
+            if (result.ok()) return Protocol::EncodeResponse(ValueResponse{result.value()});
             return Protocol::EncodeResponse(ErrorResponse{response::kError, result.status().message()});
 #else
-            return Protocol::EncodeResponse(ErrorResponse{
-                response::kNotFound, "Python not enabled"
-            });
+            return Protocol::EncodeResponse(ErrorResponse{response::kError, "Python disabled"});
 #endif
         }
         else {
-            return Protocol::EncodeResponse(ErrorResponse{
-                response::kInvalidRequest, "Unknown request type"
-            });
+            return Protocol::EncodeResponse(ErrorResponse{response::kInvalidRequest, "Unknown type"});
         }
     }, req);
 }

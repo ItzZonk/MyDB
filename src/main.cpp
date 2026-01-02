@@ -118,7 +118,51 @@ void HandleClient(socket_t client_sock, mydb::Database* db) {
                 else if constexpr (std::is_same_v<T, mydb::GetRequest>) {
                     auto result = db->Get(r.key);
                     if (result.ok()) {
-                        return mydb::Protocol::EncodeResponse(mydb::ValueResponse{result.value()});
+                        std::string val = result.value();
+                        
+                        // Field Extraction Logic
+                        if (r.field.has_value()) {
+                            std::string field_name = r.field.value();
+                             spdlog::debug("Attempting extraction. val='{}', field='{}'", val, field_name);
+                            
+                            // Try to find field:value pattern (supports quoted and unquoted keys)
+                            size_t pos = val.find("\"" + field_name + "\"");
+                            if (pos == std::string::npos) {
+                                pos = val.find(field_name + ":");
+                            }
+                            if (pos == std::string::npos) {
+                                pos = val.find(field_name);
+                            }
+                            
+                            if (pos != std::string::npos) {
+                                size_t colon = val.find(":", pos);
+                                if (colon != std::string::npos) {
+                                    size_t start = colon + 1;
+                                    while (start < val.size() && isspace(val[start])) start++;
+                                    
+                                    // Find end: comma, semicolon, or closing brace
+                                    size_t end = val.find_first_of(",;}", start);
+                                    if (end == std::string::npos) end = val.size();
+                                    
+                                    std::string extracted = val.substr(start, end - start);
+                                    
+                                    // Trim whitespace
+                                    while (!extracted.empty() && isspace(extracted.back())) extracted.pop_back();
+                                    
+                                    // Remove quotes if present
+                                    if (extracted.size() >= 2 && extracted.front() == '"' && extracted.back() == '"') {
+                                        extracted = extracted.substr(1, extracted.size() - 2);
+                                    }
+                                    
+                                    return mydb::Protocol::EncodeResponse(mydb::ValueResponse{extracted});
+                                }
+                            }
+                            return mydb::Protocol::EncodeResponse(mydb::ErrorResponse{
+                                mydb::response::kNotFound, "Field not found"
+                            });
+                        }
+                        
+                        return mydb::Protocol::EncodeResponse(mydb::ValueResponse{val});
                     }
                     return mydb::Protocol::EncodeResponse(mydb::ErrorResponse{
                         mydb::response::kNotFound, "Not found"

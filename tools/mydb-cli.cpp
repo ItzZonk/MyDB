@@ -202,6 +202,8 @@ int main(int argc, char* argv[]) {
             std::string key = tokens[1];
             std::optional<mydb::SequenceNumber> snapshot;
             
+            std::optional<std::string> field;
+            
             if (tokens.size() >= 5 && tokens[2] == "AS" && tokens[3] == "OF") {
                 try {
                     snapshot = std::stoull(tokens[4]);
@@ -209,9 +211,14 @@ int main(int argc, char* argv[]) {
                     std::cout << "Invalid timestamp: " << tokens[4] << std::endl;
                     continue;
                 }
+            } else if (tokens.size() >= 3) {
+                 // Try as field (if not a number/snapshot logic -- simplistic here)
+                 // The Protocol::ParseRequest logic tries snapshot first. 
+                 // Let's match typical CLI usage: GET key [field]
+                 field = tokens[2];
             }
             
-            request = mydb::GetRequest{key, snapshot};
+            request = mydb::GetRequest{key, snapshot, field};
         }
         else if (cmd == "PUT" || cmd == "SET") {
             if (tokens.size() < 3) {

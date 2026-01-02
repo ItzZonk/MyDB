@@ -115,6 +115,12 @@ Status Database::Initialize() {
     // Initialize components
     memtable_ = std::make_unique<MemTable>();
     
+    // Initialize Buffer Pool (for visualization)
+    BufferPoolConfig bp_config;
+    bp_config.db_file = db_path_ + "/pages.db";
+    bp_config.pool_size = 32; // 32 pages for 8x4 grid
+    buffer_pool_manager_ = std::make_unique<BufferPoolManager>(bp_config);
+    
     // WAL Manager
     wal_manager_ = std::make_unique<WALManager>(db_path_);
     
@@ -122,10 +128,13 @@ Status Database::Initialize() {
     versions_ = std::make_unique<VersionSet>(db_path_);
     
     // Load existing state or start fresh
+    // Load existing state
     if (!is_new) {
         MYDB_RETURN_IF_ERROR(versions_->LoadManifest());
-        MYDB_RETURN_IF_ERROR(Recover());
     }
+    
+    // Always attempt to recover from WAL (in case we crashed before first flush)
+    MYDB_RETURN_IF_ERROR(Recover());
     
     // Create new WAL
     auto wal_result = wal_manager_->CreateWriter(sequence_.load());
@@ -145,7 +154,7 @@ Status Database::Initialize() {
     }
 #endif
     
-    spdlog::info("Database opened successfully");
+    spdlog::info("Database opened successfully - VERSION DEBUG 2");
     return Status::Ok();
 }
 

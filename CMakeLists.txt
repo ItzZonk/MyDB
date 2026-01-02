@@ -32,6 +32,9 @@ endif()
 # ============================================================================
 if(MSVC)
     add_compile_options(/W4 /WX- /permissive-)
+    # Force static runtime for MSVC to create portable executables
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_compile_options(/MT$<$<CONFIG:Debug>:d>)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -165,6 +168,9 @@ target_link_libraries(mydb_server PRIVATE mydb_core)
 if(MYDB_BUILD_TOOLS)
     add_executable(mydb_cli tools/mydb-cli.cpp)
     target_link_libraries(mydb_cli PRIVATE mydb_core)
+
+    add_executable(wal_inspector tools/wal_inspector.cpp)
+    target_link_libraries(wal_inspector PRIVATE mydb_core)
 endif()
 
 # ============================================================================
@@ -209,6 +215,7 @@ if(MYDB_BUILD_TESTS)
         tests/test_bloom_filter.cpp
         tests/test_similarity.cpp
         tests/test_buffer_pool.cpp
+        tests/test_db_persistence.cpp
     )
     
     target_link_libraries(mydb_tests 
@@ -220,3 +227,26 @@ if(MYDB_BUILD_TESTS)
     include(GoogleTest)
     gtest_discover_tests(mydb_tests)
 endif()
+
+# ============================================================================
+# Installation & Packaging
+# ============================================================================
+if(MYDB_BUILD_TOOLS)
+    install(TARGETS mydb_server mydb_dashboard mydb_shell mydb_cli
+        RUNTIME DESTINATION bin
+    )
+else()
+    install(TARGETS mydb_server mydb_dashboard mydb_shell
+        RUNTIME DESTINATION bin
+    )
+endif()
+
+# CPack Configuration
+set(CPACK_PACKAGE_NAME "MyDB")
+set(CPACK_PACKAGE_VENDOR "ItzZonk")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "High-Performance LSM-Tree Database with TUI Dashboard")
+set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "MyDB")
+set(CPACK_GENERATOR "ZIP")
+
+include(CPack)

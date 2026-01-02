@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <mutex>
+#include <span>
 
 namespace mydb {
 
@@ -18,7 +19,9 @@ class Database;
 
 class Connection {
 public:
-    Connection(int fd, IOContext* io_context);
+    using ReadCallback = std::function<void(Connection*, int)>;
+
+    Connection(int fd, IOContext* io_context, ReadCallback callback);
     ~Connection();
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
@@ -26,16 +29,23 @@ public:
     [[nodiscard]] int Fd() const { return fd_; }
     [[nodiscard]] bool IsActive() const { return active_.load(); }
     void Close();
-    Status StartRead();
+    void StartRead();
     Status SendResponse(const std::vector<char>& data);
     [[nodiscard]] const std::string& RemoteAddress() const { return remote_addr_; }
     
+    // Public buffers for Server access (simplified for this stage)
+    std::vector<char> pending_buffer_;
+    std::vector<char> read_buffer_;
+
 private:
     int fd_;
     IOContext* io_context_;
+    ReadCallback callback_;
     std::atomic<bool> active_{true};
     std::string remote_addr_;
-    std::vector<char> read_buffer_, write_buffer_;
+    std::vector<char> write_buffer_;
+    
+    static constexpr size_t kReadBufferSize = 8192;
 };
 
 using RequestHandler = std::function<std::vector<char>(const std::vector<char>&, Connection*)>;
@@ -61,7 +71,6 @@ public:
 private:
     void HandleAccept(int result);
     void HandleRead(Connection* conn, int result);
-    void ProcessRequest(Connection* conn, std::vector<char> data);
     std::vector<char> DefaultHandler(const std::vector<char>& request, Connection* conn);
     
     Options options_;

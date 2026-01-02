@@ -18,14 +18,16 @@ struct DeleteRequest { std::string key; };
 struct GetRequest {
     std::string key;
     std::optional<SequenceNumber> snapshot; // If empty, use latest
+    std::optional<std::string> field;       // JSON field to extract
 };
 struct ExecPythonRequest { std::string script; };
 struct PingRequest {};
 struct StatusRequest {};
 struct FlushRequest {};
 struct CompactRequest { int level{-1}; };
+struct IntrospectRequest { std::string target; };
 
-using Request = std::variant<PutRequest, DeleteRequest, GetRequest, ExecPythonRequest, PingRequest, StatusRequest, FlushRequest, CompactRequest>;
+using Request = std::variant<PutRequest, DeleteRequest, GetRequest, ExecPythonRequest, PingRequest, StatusRequest, FlushRequest, CompactRequest, IntrospectRequest>;
 
 struct OkResponse { std::string message; };
 struct ValueResponse { std::string value; };
@@ -41,19 +43,26 @@ public:
     static Result<Response> ParseResponse(const Slice& data);
     static std::vector<char> EncodeResponse(const Response& response);
     
-    static constexpr size_t kHeaderSize = 5;
+    // RESP Helpers
     static bool HasCompleteMessage(const Slice& data);
-    static size_t GetMessageLength(const Slice& header);
     
 private:
-    static void EncodeUint8(std::vector<char>& buf, uint8_t value);
-    static void EncodeUint32(std::vector<char>& buf, uint32_t value);
-    static void EncodeUint64(std::vector<char>& buf, uint64_t value);
-    static void EncodeString(std::vector<char>& buf, const std::string& str);
-    static Result<uint8_t> DecodeUint8(const Slice& data, size_t& offset);
-    static Result<uint32_t> DecodeUint32(const Slice& data, size_t& offset);
-    static Result<uint64_t> DecodeUint64(const Slice& data, size_t& offset);
-    static Result<std::string> DecodeString(const Slice& data, size_t& offset);
+    // RESP Encoding
+    static void EncodeSimpleString(std::vector<char>& buf, const std::string& str);
+    static void EncodeError(std::vector<char>& buf, const std::string& str);
+    static void EncodeInteger(std::vector<char>& buf, int64_t val);
+    static void EncodeBulkString(std::vector<char>& buf, const std::string& str);
+    static void EncodeArray(std::vector<char>& buf, size_t count);
+    
+    // RESP Decoding
+    static Result<std::string> DecodeSimpleString(const Slice& data, size_t& offset);
+    static Result<std::string> DecodeError(const Slice& data, size_t& offset);
+    static Result<int64_t> DecodeInteger(const Slice& data, size_t& offset);
+    static Result<std::string> DecodeBulkString(const Slice& data, size_t& offset);
+    static Result<size_t> DecodeArrayHeader(const Slice& data, size_t& offset);
+    
+    // Utility
+    static std::optional<size_t> FindCRLF(const Slice& data, size_t offset);
 };
 
 } // namespace mydb

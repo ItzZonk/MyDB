@@ -341,6 +341,32 @@ public:
     size_t GetPoolSize() const { return pool_size_; }
 
     /**
+     * @brief Public interface for storage engine introspection
+     */
+    struct FrameInfo {
+        page_id_t page_id{INVALID_PAGE_ID};
+        int pin_count{0};
+        bool is_dirty{false};
+    };
+
+    /**
+     * @brief Get a snapshot of the buffer pool state for visualization
+     */
+    std::vector<FrameInfo> GetState() {
+        std::lock_guard<std::mutex> lock(latch_);
+        std::vector<FrameInfo> state(pool_size_);
+        
+        for (const auto& [pid, fid] : page_table_) {
+            if (fid < pool_size_) {
+                state[fid].page_id = pid;
+                state[fid].pin_count = pages_[fid].GetPinCount();
+                state[fid].is_dirty = pages_[fid].IsDirty();
+            }
+        }
+        return state;
+    }
+
+    /**
      * @brief Get the disk manager
      */
     DiskManager* GetDiskManager() { return disk_manager_.get(); }

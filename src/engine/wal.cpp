@@ -122,13 +122,17 @@ Status WALWriter::Append(OperationType type, const Slice& key,
     // Write to file
     file_.write(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
     if (!file_.good()) {
+        spdlog::error("WAL Write failed! Size={}", buffer_.size());
         return Status::IOError("Failed to write to WAL");
     }
     
+    // Flush to ensure data reaches OS buffer (persistence against process crash)
+    file_.flush();
+    
     size_ += buffer_.size();
     
-    spdlog::trace("WAL::Append seq={}, op={}, key_len={}, val_len={}", 
-                  sequence, static_cast<int>(type), key_len, val_len);
+    spdlog::trace("WAL::Append success. seq={}, size={}, total_size={}", 
+                  sequence, buffer_.size(), size_);
     
     return Status::Ok();
 }
@@ -137,6 +141,10 @@ Status WALWriter::Sync() {
     if (!file_.is_open()) {
         return Status::IOError("WAL file not open");
     }
+    // No need to flush again if we flush in Append, but Sync usually implies fsync?
+    // standard library doesn't give direct fsync on fstream. 
+    // file_.flush() is userspace -> kernel.
+    // For true disk sync, we need platform specific code, but let's stick to flush for now.
     file_.flush();
     return file_.good() ? Status::Ok() : Status::IOError("Failed to sync WAL");
 }
@@ -333,8 +341,19 @@ std::vector<std::string> WALManager::GetWALFiles() const {
         }
     }
     
-    // Sort by sequence number (filename)
-    std::sort(files.begin(), files.end());
+    // Sort by sequence number numerically
+    std::sort(files.begin(), files.end(), [](const std::string& a, const std::string& b) {
+        auto path_a = std::filesystem::path(a);
+        auto path_b = std::filesystem::path(b);
+        try {
+            uint64_t seq_a = std::stoull(path_a.stem().string());
+            uint64_t seq_b = std::stoull(path_b.stem().string());
+            return seq_a < seq_b;
+        } catch (...) {
+            // Fallback to string sort if parsing fails
+            return a < b;
+        }
+    });
     
     return files;
 }

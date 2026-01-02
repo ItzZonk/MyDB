@@ -16,7 +16,7 @@ namespace mydb {
 class BloomFilter;
 
 struct SSTableFooter {
-    static constexpr size_t kEncodedLength = 48;
+    static constexpr size_t kEncodedLength = 60;
     uint64_t data_block_offset, data_block_size;
     uint64_t index_block_offset, index_block_size;
     uint64_t bloom_filter_offset, bloom_filter_size;

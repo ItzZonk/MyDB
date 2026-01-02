@@ -1,255 +1,405 @@
 /**
  * @file protocol.cpp
- * @brief Binary protocol implementation
+ * @brief RESP (Redis Serialization Protocol) implementation
  */
 
 #include <mydb/network/protocol.hpp>
 
-#include <cstring>
+#include <string>
+#include <charconv>
+#include <algorithm>
 
 namespace mydb {
 
 // ============================================================================
-// Encode Helpers
+// Utility
 // ============================================================================
 
-void Protocol::EncodeUint8(std::vector<char>& buf, uint8_t value) {
-    buf.push_back(static_cast<char>(value));
-}
-
-void Protocol::EncodeUint32(std::vector<char>& buf, uint32_t value) {
-    for (int i = 0; i < 4; ++i) {
-        buf.push_back(static_cast<char>((value >> (i * 8)) & 0xFF));
+std::optional<size_t> Protocol::FindCRLF(const Slice& data, size_t offset) {
+    for (size_t i = offset; i + 1 < data.size(); ++i) {
+        if (data[i] == '\r' && data[i+1] == '\n') {
+            return i;
+        }
     }
+    return std::nullopt;
 }
 
-void Protocol::EncodeUint64(std::vector<char>& buf, uint64_t value) {
-    for (int i = 0; i < 8; ++i) {
-        buf.push_back(static_cast<char>((value >> (i * 8)) & 0xFF));
-    }
-}
+// ============================================================================
+// RESP Encoding Helpers
+// ============================================================================
 
-void Protocol::EncodeString(std::vector<char>& buf, const std::string& str) {
-    EncodeUint32(buf, static_cast<uint32_t>(str.size()));
+void Protocol::EncodeSimpleString(std::vector<char>& buf, const std::string& str) {
+    buf.push_back('+');
     buf.insert(buf.end(), str.begin(), str.end());
+    buf.push_back('\r');
+    buf.push_back('\n');
+}
+
+void Protocol::EncodeError(std::vector<char>& buf, const std::string& str) {
+    buf.push_back('-');
+    buf.insert(buf.end(), str.begin(), str.end());
+    buf.push_back('\r');
+    buf.push_back('\n');
+}
+
+void Protocol::EncodeInteger(std::vector<char>& buf, int64_t val) {
+    buf.push_back(':');
+    std::string s = std::to_string(val);
+    buf.insert(buf.end(), s.begin(), s.end());
+    buf.push_back('\r');
+    buf.push_back('\n');
+}
+
+void Protocol::EncodeBulkString(std::vector<char>& buf, const std::string& str) {
+    buf.push_back('$');
+    std::string len_str = std::to_string(str.size());
+    buf.insert(buf.end(), len_str.begin(), len_str.end());
+    buf.push_back('\r');
+    buf.push_back('\n');
+    buf.insert(buf.end(), str.begin(), str.end());
+    buf.push_back('\r');
+    buf.push_back('\n');
+}
+
+void Protocol::EncodeArray(std::vector<char>& buf, size_t count) {
+    buf.push_back('*');
+    std::string s = std::to_string(count);
+    buf.insert(buf.end(), s.begin(), s.end());
+    buf.push_back('\r');
+    buf.push_back('\n');
 }
 
 // ============================================================================
-// Decode Helpers
+// RESP Decoding Helpers
 // ============================================================================
 
-Result<uint8_t> Protocol::DecodeUint8(const Slice& data, size_t& offset) {
-    if (offset >= data.size()) {
-        return Status::Corruption("Buffer underflow");
-    }
-    return static_cast<uint8_t>(data[offset++]);
-}
-
-Result<uint32_t> Protocol::DecodeUint32(const Slice& data, size_t& offset) {
-    if (offset + 4 > data.size()) {
-        return Status::Corruption("Buffer underflow");
-    }
-    uint32_t value = 0;
-    for (int i = 0; i < 4; ++i) {
-        value |= (static_cast<uint32_t>(static_cast<unsigned char>(data[offset + i])) << (i * 8));
-    }
-    offset += 4;
-    return value;
-}
-
-Result<uint64_t> Protocol::DecodeUint64(const Slice& data, size_t& offset) {
-    if (offset + 8 > data.size()) {
-        return Status::Corruption("Buffer underflow");
-    }
-    uint64_t value = 0;
-    for (int i = 0; i < 8; ++i) {
-        value |= (static_cast<uint64_t>(static_cast<unsigned char>(data[offset + i])) << (i * 8));
-    }
-    offset += 8;
-    return value;
-}
-
-Result<std::string> Protocol::DecodeString(const Slice& data, size_t& offset) {
-    auto len_result = DecodeUint32(data, offset);
-    if (!len_result.ok()) return len_result.status();
+Result<std::string> Protocol::DecodeSimpleString(const Slice& data, size_t& offset) {
+    if (offset >= data.size()) return Status::Corruption("Buffer underflow");
+    if (data[offset] != '+') return Status::InvalidArgument("Expected Simple String (+)");
     
-    uint32_t len = len_result.value();
-    if (offset + len > data.size()) {
-        return Status::Corruption("String truncated");
+    auto crlf = FindCRLF(data, offset + 1);
+    if (!crlf) return Status::Corruption("Missing CRLF");
+    
+    std::string res(data.data() + offset + 1, *crlf - (offset + 1));
+    offset = *crlf + 2;
+    return res;
+}
+
+Result<std::string> Protocol::DecodeError(const Slice& data, size_t& offset) {
+    if (offset >= data.size()) return Status::Corruption("Buffer underflow");
+    if (data[offset] != '-') return Status::InvalidArgument("Expected Error (-)");
+    
+    auto crlf = FindCRLF(data, offset + 1);
+    if (!crlf) return Status::Corruption("Missing CRLF");
+    
+    std::string res(data.data() + offset + 1, *crlf - (offset + 1));
+    offset = *crlf + 2;
+    return res;
+}
+
+Result<int64_t> Protocol::DecodeInteger(const Slice& data, size_t& offset) {
+    if (offset >= data.size()) return Status::Corruption("Buffer underflow");
+    if (data[offset] != ':') return Status::InvalidArgument("Expected Integer (:)");
+    
+    auto crlf = FindCRLF(data, offset + 1);
+    if (!crlf) return Status::Corruption("Missing CRLF");
+    
+    std::string str(data.data() + offset + 1, *crlf - (offset + 1));
+    offset = *crlf + 2;
+    
+    try {
+        return std::stoll(str);
+    } catch (...) {
+        return Status::InvalidArgument("Invalid integer format");
+    }
+}
+
+Result<std::string> Protocol::DecodeBulkString(const Slice& data, size_t& offset) {
+    if (offset >= data.size()) return Status::Corruption("Buffer underflow");
+    if (data[offset] != '$') return Status::InvalidArgument("Expected Bulk String ($)");
+    
+    auto header_crlf = FindCRLF(data, offset + 1);
+    if (!header_crlf) return Status::Corruption("Missing header CRLF");
+    
+    std::string len_str(data.data() + offset + 1, *header_crlf - (offset + 1));
+    offset = *header_crlf + 2;
+    
+    int64_t len = 0;
+    try {
+        len = std::stoll(len_str);
+    } catch (...) {
+        return Status::InvalidArgument("Invalid length");
     }
     
-    std::string result(data.data() + offset, len);
-    offset += len;
-    return result;
+    if (len == -1) return Status::NotFound("Null Bulk String");
+    if (len < 0) return Status::InvalidArgument("Negative length");
+    
+    if (offset + len + 2 > data.size()) return Status::Corruption("String truncated");
+    
+    std::string res(data.data() + offset, static_cast<size_t>(len));
+    
+    // Validate trailing CRLF
+    if (data[offset + len] != '\r' || data[offset + len + 1] != '\n') {
+        return Status::Corruption("Missing trailing CRLF");
+    }
+    
+    offset += len + 2;
+    return res;
+}
+
+Result<size_t> Protocol::DecodeArrayHeader(const Slice& data, size_t& offset) {
+    if (offset >= data.size()) return Status::Corruption("Buffer underflow");
+    if (data[offset] != '*') return Status::InvalidArgument("Expected Array (*)");
+    
+    auto crlf = FindCRLF(data, offset + 1);
+    if (!crlf) return Status::Corruption("Missing CRLF");
+    
+    std::string len_str(data.data() + offset + 1, *crlf - (offset + 1));
+    offset = *crlf + 2;
+    
+    try {
+        int64_t len = std::stoll(len_str);
+        if (len < 0) return 0; // Null array treated as empty
+        return static_cast<size_t>(len);
+    } catch (...) {
+        return Status::InvalidArgument("Invalid array length");
+    }
 }
 
 // ============================================================================
-// Request Parsing
+// Public Interface
 // ============================================================================
 
 bool Protocol::HasCompleteMessage(const Slice& data) {
-    if (data.size() < kHeaderSize) return false;
+    // Basic structural check only. 
+    // A robust implementation would parse lengths recursively.
+    // For now, check if we have matching CRLF for the apparent structure?
+    // Actually, simple check: Do we have at least one CRLF?
+    // And if it's Bulk String ($N), do we have N bytes + CRLF?
     
-    size_t offset = 1;  // Skip opcode
-    uint32_t len = 0;
-    for (int i = 0; i < 4; ++i) {
-        len |= (static_cast<uint32_t>(static_cast<unsigned char>(data[offset + i])) << (i * 8));
+    if (data.empty()) return false;
+    
+    size_t offset = 0;
+    char type = data[0];
+    auto first_crlf = FindCRLF(data, 0);
+    if (!first_crlf) return false;
+    
+    if (type == '+' || type == '-' || type == ':') {
+        return true; 
     }
     
-    return data.size() >= kHeaderSize + len;
-}
-
-size_t Protocol::GetMessageLength(const Slice& header) {
-    if (header.size() < kHeaderSize) return 0;
-    
-    size_t offset = 1;  // Skip opcode
-    uint32_t len = 0;
-    for (int i = 0; i < 4; ++i) {
-        len |= (static_cast<uint32_t>(static_cast<unsigned char>(header[offset + i])) << (i * 8));
+    if (type == '$') {
+        // Parse length
+        std::string len_str(data.data() + 1, *first_crlf - 1);
+        try {
+            int64_t len = std::stoll(len_str);
+            if (len == -1) return true; // Null bulk string
+            if (len < 0) return false;
+            
+            // Need headers + body + CRLF
+            size_t required = (*first_crlf + 2) + len + 2;
+            return data.size() >= required;
+        } catch (...) { return false; }
     }
-    return kHeaderSize + len;
+    
+    if (type == '*') {
+        // Only minimal check for array - this is hard without full parse
+        // Assume incomplete if we can't parse successfully?
+        // But ParseRequest will return error if incomplete.
+        // We need this for buffer accumulation.
+        // Let's implement a 'Dry Run' parser if needed, or just return true if it looks plausible
+        // But for reliable networking, we need exact framing.
+        // Let's rely on ParseRequest failure with 'Corruption' vs 'NotEnoughData'?
+        // Or implement a Scan helper.
+        
+        // Quick scan for array
+        std::string count_str(data.data() + 1, *first_crlf - 1);
+        try {
+            int64_t count = std::stoll(count_str);
+            size_t pos = *first_crlf + 2;
+            for (int i=0; i<count; ++i) {
+                if (pos >= data.size()) return false;
+                char subtype = data[pos];
+                auto next_crlf = FindCRLF(data, pos);
+                if (!next_crlf) return false;
+                
+                if (subtype == '$') {
+                    std::string slen(data.data() + pos + 1, *next_crlf - (pos + 1));
+                    int64_t len = std::stoll(slen);
+                    pos = *next_crlf + 2;
+                    if (len >= 0) {
+                         pos += len + 2;
+                    }
+                } else if (subtype == ':') {
+                     pos = *next_crlf + 2;
+                } else {
+                     // Assume simple string or error
+                     pos = *next_crlf + 2;
+                }
+            }
+            return pos <= data.size();
+        } catch (...) { return false; }
+    }
+    
+    return false;
 }
 
 Result<Request> Protocol::ParseRequest(const Slice& data) {
-    if (data.size() < kHeaderSize) {
-        return Status::InvalidArgument("Request too short");
-    }
-    
     size_t offset = 0;
     
-    auto op_result = DecodeUint8(data, offset);
-    if (!op_result.ok()) return op_result.status();
-    uint8_t opcode = op_result.value();
+    // Expecting RESP Array: *N \r\n ...
+    auto array_len_res = DecodeArrayHeader(data, offset);
+    if (!array_len_res.ok()) return array_len_res.status();
     
-    // Skip payload length
-    offset += 4;
+    size_t argc = array_len_res.value();
+    if (argc == 0) return Status::InvalidArgument("Empty command");
     
-    switch (opcode) {
-        case opcode::kPut: {
-            auto key_result = DecodeString(data, offset);
-            if (!key_result.ok()) return key_result.status();
-            
-            auto val_result = DecodeString(data, offset);
-            if (!val_result.ok()) return val_result.status();
-            
-            return Request{PutRequest{key_result.value(), val_result.value()}};
-        }
-        
-        case opcode::kDelete: {
-            auto key_result = DecodeString(data, offset);
-            if (!key_result.ok()) return key_result.status();
-            
-            return Request{DeleteRequest{key_result.value()}};
-        }
-        
-        case opcode::kGet: {
-            auto key_result = DecodeString(data, offset);
-            if (!key_result.ok()) return key_result.status();
-            
-            std::optional<SequenceNumber> snapshot;
-            if (offset < data.size()) {
-                auto has_snapshot = DecodeUint8(data, offset);
-                if (has_snapshot.ok() && has_snapshot.value() == 1) {
-                    auto snap_val = DecodeUint64(data, offset);
-                    if (snap_val.ok()) {
-                        snapshot = snap_val.value();
-                    }
-                }
-            }
-            
-            return Request{GetRequest{key_result.value(), snapshot}};
-        }
-        
-        case opcode::kExecPython: {
-            auto script_result = DecodeString(data, offset);
-            if (!script_result.ok()) return script_result.status();
-            
-            return Request{ExecPythonRequest{script_result.value()}};
-        }
-        
-        case opcode::kPing:
-            return Request{PingRequest{}};
-        
-        case opcode::kStatus:
-            return Request{StatusRequest{}};
-        
-        case opcode::kFlush:
-            return Request{FlushRequest{}};
-        
-        case opcode::kCompact: {
-            int level = -1;
-            if (offset < data.size()) {
-                auto level_result = DecodeUint32(data, offset);
-                if (level_result.ok()) {
-                    level = static_cast<int>(level_result.value());
-                }
-            }
-            return Request{CompactRequest{level}};
-        }
-        
-        default:
-            return Status::InvalidArgument("Unknown opcode");
+    std::vector<std::string> args;
+    args.reserve(argc);
+    
+    for (size_t i = 0; i < argc; ++i) {
+        // Arguments are usually Bulk Strings
+        auto arg_res = DecodeBulkString(data, offset);
+        if (!arg_res.ok()) return arg_res.status();
+        args.push_back(arg_res.value());
     }
+    
+    if (args.empty()) return Status::InvalidArgument("Empty command args");
+    
+    std::string cmd = args[0];
+    // Case-insensitive normalization
+    for (auto& c : cmd) c = static_cast<char>(toupper(c));
+    
+    if (cmd == "GET") {
+        if (args.size() < 2) return Status::InvalidArgument("GET requires key");
+        std::optional<SequenceNumber> snap;
+        std::optional<std::string> field;
+        
+        if (args.size() >= 3) {
+            // Try to parse as snapshot ID (number)
+            bool is_number = true;
+            try { 
+                size_t idx;
+                snap = std::stoull(args[2], &idx);
+                if (idx != args[2].size()) is_number = false; // Not fully numeric
+            } catch (...) { is_number = false; }
+            
+            // If not a number, treat as field
+            if (!is_number) {
+                snap.reset();
+                field = args[2];
+            }
+        }
+        return Request{GetRequest{args[1], snap, field}};
+    }
+    else if (cmd == "PUT" || cmd == "SET") {
+        if (args.size() < 3) return Status::InvalidArgument("PUT requires key and value");
+        return Request{PutRequest{args[1], args[2]}};
+    }
+    else if (cmd == "DEL" || cmd == "DELETE") {
+        if (args.size() < 2) return Status::InvalidArgument("DEL requires key");
+        return Request{DeleteRequest{args[1]}};
+    }
+    else if (cmd == "PING") {
+        return Request{PingRequest{}};
+    }
+    else if (cmd == "STATUS" || cmd == "INFO") {
+        return Request{StatusRequest{}};
+    }
+    else if (cmd == "FLUSH") {
+        return Request{FlushRequest{}};
+    }
+    else if (cmd == "COMPACT") {
+        int level = -1;
+        if (args.size() >= 2) {
+            try { level = std::stoi(args[1]); } catch (...) {}
+        }
+        return Request{CompactRequest{level}};
+    }
+    else if (cmd == "EXEC" || cmd == "PYTHON") {
+        if (args.size() < 2) return Status::InvalidArgument("EXEC requires script");
+        return Request{ExecPythonRequest{args[1]}};
+    }
+    else if (cmd == "INTROSPECT") {
+        if (args.size() < 2) return Status::InvalidArgument("INTROSPECT requires target");
+        return Request{IntrospectRequest{args[1]}};
+    }
+    
+    return Status::InvalidArgument("Unknown command: " + cmd);
 }
-
-// ============================================================================
-// Request Encoding
-// ============================================================================
 
 std::vector<char> Protocol::EncodeRequest(const Request& request) {
     std::vector<char> buf;
-    std::vector<char> payload;
     
     std::visit([&](auto&& req) {
         using T = std::decay_t<decltype(req)>;
         
         if constexpr (std::is_same_v<T, PutRequest>) {
-            EncodeUint8(buf, opcode::kPut);
-            EncodeString(payload, req.key);
-            EncodeString(payload, req.value);
+            EncodeArray(buf, 3);
+            EncodeBulkString(buf, "PUT");
+            EncodeBulkString(buf, req.key);
+            EncodeBulkString(buf, req.value);
         }
         else if constexpr (std::is_same_v<T, DeleteRequest>) {
-            EncodeUint8(buf, opcode::kDelete);
-            EncodeString(payload, req.key);
+            EncodeArray(buf, 2);
+            EncodeBulkString(buf, "DEL");
+            EncodeBulkString(buf, req.key);
         }
         else if constexpr (std::is_same_v<T, GetRequest>) {
-            EncodeUint8(buf, opcode::kGet);
-            EncodeString(payload, req.key);
+            size_t count = 2;
+            if (req.snapshot.has_value()) count++;
+            if (req.field.has_value()) count++;
+            
+            EncodeArray(buf, count);
+            EncodeBulkString(buf, "GET");
+            EncodeBulkString(buf, req.key);
+            
+            // Order matters? Protocol usually: CMD KEY [ARGS...]
+            // Our Parse parses args[2] as either.
+            // When encoding, we should probably be consistent.
+            // If both present? Unlikely given logic.
+            // Just append available ones.
             if (req.snapshot.has_value()) {
-                EncodeUint8(payload, 1);
-                EncodeUint64(payload, req.snapshot.value());
-            } else {
-                EncodeUint8(payload, 0);
+                EncodeBulkString(buf, std::to_string(req.snapshot.value()));
+            }
+            if (req.field.has_value()) {
+                EncodeBulkString(buf, req.field.value());
             }
         }
         else if constexpr (std::is_same_v<T, ExecPythonRequest>) {
-            EncodeUint8(buf, opcode::kExecPython);
-            EncodeString(payload, req.script);
+            EncodeArray(buf, 2);
+            EncodeBulkString(buf, "EXEC");
+            EncodeBulkString(buf, req.script);
         }
         else if constexpr (std::is_same_v<T, PingRequest>) {
-            EncodeUint8(buf, opcode::kPing);
+            EncodeArray(buf, 1);
+            EncodeBulkString(buf, "PING");
         }
         else if constexpr (std::is_same_v<T, StatusRequest>) {
-            EncodeUint8(buf, opcode::kStatus);
+            EncodeArray(buf, 1);
+            EncodeBulkString(buf, "STATUS");
         }
         else if constexpr (std::is_same_v<T, FlushRequest>) {
-            EncodeUint8(buf, opcode::kFlush);
+            EncodeArray(buf, 1);
+            EncodeBulkString(buf, "FLUSH");
         }
         else if constexpr (std::is_same_v<T, CompactRequest>) {
-            EncodeUint8(buf, opcode::kCompact);
-            EncodeUint32(payload, static_cast<uint32_t>(req.level));
+            size_t count = (req.level >= 0) ? 2 : 1;
+            EncodeArray(buf, count);
+            EncodeBulkString(buf, "COMPACT");
+            if (req.level >= 0) {
+                 EncodeBulkString(buf, std::to_string(req.level));
+            }
+        }
+        else if constexpr (std::is_same_v<T, IntrospectRequest>) {
+            EncodeArray(buf, 2);
+            EncodeBulkString(buf, "INTROSPECT");
+            EncodeBulkString(buf, req.target);
         }
     }, request);
     
-    EncodeUint32(buf, static_cast<uint32_t>(payload.size()));
-    buf.insert(buf.end(), payload.begin(), payload.end());
-    
     return buf;
 }
-
-// ============================================================================
-// Response Encoding
-// ============================================================================
 
 std::vector<char> Protocol::EncodeResponse(const Response& response) {
     std::vector<char> buf;
@@ -258,57 +408,81 @@ std::vector<char> Protocol::EncodeResponse(const Response& response) {
         using T = std::decay_t<decltype(resp)>;
         
         if constexpr (std::is_same_v<T, OkResponse>) {
-            EncodeUint8(buf, response::kOk);
-            EncodeString(buf, resp.message);
+            EncodeSimpleString(buf, resp.message.empty() ? "OK" : resp.message);
         }
         else if constexpr (std::is_same_v<T, ValueResponse>) {
-            EncodeUint8(buf, response::kOk);
-            EncodeString(buf, resp.value);
+            EncodeBulkString(buf, resp.value);
         }
         else if constexpr (std::is_same_v<T, ErrorResponse>) {
-            EncodeUint8(buf, resp.code);
-            EncodeString(buf, resp.message);
+            EncodeError(buf, "ERR " + resp.message);
         }
         else if constexpr (std::is_same_v<T, StatusResponse>) {
-            EncodeUint8(buf, response::kOk);
-            EncodeUint64(buf, resp.entries);
-            EncodeUint64(buf, resp.memtable_size);
-            EncodeUint64(buf, resp.sstable_count);
-            EncodeString(buf, resp.version);
+            // Encode as Bulk String with key:value lines
+            std::string info;
+            info += "entries:" + std::to_string(resp.entries) + "\n";
+            info += "memtable_size:" + std::to_string(resp.memtable_size) + "\n";
+            info += "sstables:" + std::to_string(resp.sstable_count) + "\n";
+            info += "version:" + resp.version + "\n";
+            EncodeBulkString(buf, info);
         }
     }, response);
     
     return buf;
 }
 
-// ============================================================================
-// Response Parsing
-// ============================================================================
-
 Result<Response> Protocol::ParseResponse(const Slice& data) {
-    if (data.empty()) {
-        return Status::InvalidArgument("Empty response");
-    }
-    
+    if (data.empty()) return Status::InvalidArgument("Empty data");
     size_t offset = 0;
     
-    auto code_result = DecodeUint8(data, offset);
-    if (!code_result.ok()) return code_result.status();
+    char type = data[0];
     
-    uint8_t code = code_result.value();
-    
-    if (code == response::kOk) {
-        auto str_result = DecodeString(data, offset);
-        if (str_result.ok()) {
-            return Response{ValueResponse{str_result.value()}};
+    if (type == '+') {
+        auto res = DecodeSimpleString(data, offset);
+        if (!res.ok()) return res.status();
+        return Response{OkResponse{res.value()}};
+    }
+    else if (type == '-') {
+        // Error
+        auto res = DecodeError(data, offset);
+        if (!res.ok()) return res.status();
+        // Strip ERR prefix if present
+        std::string msg = res.value();
+        if (msg.rfind("ERR ", 0) == 0) msg.erase(0, 4);
+        return Response{ErrorResponse{response::kError, msg}};
+    }
+    else if (type == '$') {
+        auto res = DecodeBulkString(data, offset);
+        if (res.status().code() == StatusCode::kNotFound) {
+             // Null Bulk String -> "Not Found" error for now?
+             // Or we need a NullResponse type?
+             // For Get, existing code expects ErrorResponse(kNotFound) on miss.
+             return Response{ErrorResponse{response::kNotFound, "Not found"}};
         }
-        return Response{OkResponse{""}};
+        if (!res.ok()) return res.status();
+        
+        // Is it status info? No way to know from type.
+        // Assume ValueResponse. 
+        // If the caller expects StatusResponse, it might need to parse the string.
+        // But ParseResponse returns variant.
+        // Let's assume generic ValueResponse for bulk strings.
+        // But wait, DecodeBulkString is also used for Status.
+        // Existing Dashboard logic expects StatusResponse struct.
+        // But Protocol::ParseResponse returns `Response` variant.
+        // If I return ValueResponse, dashboard will print the string.
+        // Which is actually FINE for `dashboard.cpp` console!
+        // `render_console` logic:
+        // if ValueResponse -> print r.value
+        // So formatting Status as string is actually BETTER for console.
+        
+        return Response{ValueResponse{res.value()}};
+    }
+    else if (type == ':') {
+        auto res = DecodeInteger(data, offset);
+        if (!res.ok()) return res.status();
+        return Response{ValueResponse{std::to_string(res.value())}};
     }
     
-    auto msg_result = DecodeString(data, offset);
-    std::string msg = msg_result.ok() ? msg_result.value() : "";
-    
-    return Response{ErrorResponse{code, msg}};
+    return Status::InvalidArgument("Unknown RESP type");
 }
 
 } // namespace mydb

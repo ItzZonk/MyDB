@@ -8,7 +8,9 @@
 #include <mydb/engine/memtable.hpp>
 #include <mydb/engine/sstable.hpp>
 #include <mydb/engine/wal.hpp>
+#include <mydb/engine/wal.hpp>
 #include <mydb/engine/compactor.hpp>
+#include <mydb/storage/buffer_pool.hpp>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -84,6 +86,9 @@ public:
     [[nodiscard]] std::string GetVersion() const;
     [[nodiscard]] const Options& GetOptions() const { return options_; }
     
+    // Phase 3: Introspection
+    BufferPoolManager* GetBufferPoolManager() { return buffer_pool_manager_.get(); }
+    
 private:
     explicit Database(const Options& options);
     Status Initialize();
@@ -98,6 +103,7 @@ private:
     std::unique_ptr<MemTable> memtable_, immutable_memtable_;
     std::unique_ptr<WALWriter> wal_;
     std::unique_ptr<WALManager> wal_manager_;
+    std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<VersionSet> versions_;
     std::unique_ptr<Compactor> compactor_;
 #ifdef MYDB_ENABLE_PYTHON
