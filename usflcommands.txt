@@ -1,0 +1,1 @@
+.wal files checker: ./build/Release/wal_inspector.exe ./build/Release/mydb_data/0.wal
